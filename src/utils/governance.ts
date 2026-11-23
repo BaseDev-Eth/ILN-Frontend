@@ -64,6 +64,11 @@ import {
 } from '@/lib/governance/create-proposal';
 import { proposalTrackingScope, recoverTrackedProposal } from '@/lib/governance/metadata';
 import { governanceMocksAllowed } from '@/lib/governance/mock-guard';
+import {
+  loadProposalList,
+  ProposalLoadError,
+  type ProposalLoadErrorCode,
+} from '@/lib/governance/proposal-events';
 import { getApprovedTokenIds, getTokenMetadata } from '@/utils/soroban';
 
 export type { CreateProposalFormType, CreateProposalPayload, AcceptedToken, ProtocolParameters };
@@ -452,6 +457,11 @@ export type GovernanceAction = keyof typeof GOVERNANCE_INTEGRATION_STATUS;
 const NOW = Math.floor(Date.now() / 1000);
 const DAY = 86400;
 
+/**
+ * Test/story fixture only. No production read path consumes this array:
+ * the proposal list is loaded from governance contract events and the
+ * `list_proposals` query (#1040).
+ */
 export const MOCK_PROPOSALS: Proposal[] = [
   {
     id: 1,
@@ -851,62 +861,78 @@ export function parseProposalFromNative(value: unknown): Proposal {
 
 export class GovernanceReadError extends Error {
   readonly code = 'GOVERNANCE_READ_UNAVAILABLE';
+  /** Specific proposal-load failure, when the read was the proposal list (#1040). */
+  readonly reason?: ProposalLoadErrorCode;
   constructor(
     message: string,
     override readonly cause?: unknown
   ) {
     super(`GOVERNANCE_READ_UNAVAILABLE: ${message}`);
     this.name = 'GovernanceReadError';
+    if (cause instanceof ProposalLoadError) this.reason = cause.code;
   }
 }
 
+/**
+ * @deprecated The proposal list no longer has a mock fallback (#1040). The
+ * option is accepted for source compatibility and ignored.
+ */
 export interface FetchProposalsOptions {
   allowMockFallback?: boolean;
 }
 
-export async function fetchProposals(options: FetchProposalsOptions = {}): Promise<Proposal[]> {
-  // A caller can never enable mock proposals in a production build (#1320).
-  const allowMockFallback = options.allowMockFallback === true && governanceMocksAllowed();
-  let callResult: rpc.Api.SimulateTransactionResponse;
-  try {
-    const tx = buildGovernanceReadTransaction('list_proposals');
-    callResult = await server.simulateTransaction(tx);
-  } catch (err) {
-    if (allowMockFallback) {
-      return MOCK_PROPOSALS.map((p) => ({
-        ...p,
-        userVote: userVotes.get(p.id),
-        vetoHistory: getVetoHistory(p.id),
-      }));
-    }
-    throw new GovernanceReadError(
-      'Failed to simulate list_proposals read on governance contract',
-      err
+/** Read `list_proposals` from the governance contract by simulation. */
+async function queryProposalList(): Promise<unknown[]> {
+  const tx = buildGovernanceReadTransaction('list_proposals');
+  const callResult = await server.simulateTransaction(tx);
+  if (!rpc.Api.isSimulationSuccess(callResult)) {
+    throw new ProposalLoadError(
+      'PROPOSAL_QUERY_UNAVAILABLE',
+      'Governance authority returned an unsuccessful simulation for list_proposals'
     );
   }
+  if (!callResult.result?.retval) return [];
+  const native = scValToNative(callResult.result.retval);
+  if (!Array.isArray(native)) {
+    throw new ProposalLoadError(
+      'PROPOSAL_RECORD_INVALID',
+      'list_proposals did not return a list of proposals'
+    );
+  }
+  return native;
+}
 
-  if (rpc.Api.isSimulationSuccess(callResult) && callResult.result?.retval) {
-    const native = scValToNative(callResult.result.retval);
-    if (Array.isArray(native)) {
-      return native.map((p) => ({
-        ...parseProposalFromNative(p),
-        userVote: userVotes.get(Number(p.id)),
-        vetoHistory: getVetoHistory(Number(p.id)),
-      }));
-    }
+/**
+ * Load the proposal list from governance contract events and the
+ * `list_proposals` query (#1040). Every record is chain-backed; there is no
+ * mock fallback. Failures throw {@link GovernanceReadError} whose `reason`
+ * carries the specific {@link ProposalLoadErrorCode}.
+ */
+export async function fetchProposals(_options: FetchProposalsOptions = {}): Promise<Proposal[]> {
+  let result: Awaited<ReturnType<typeof loadProposalList>>;
+  try {
+    result = await loadProposalList({
+      server,
+      governanceContractId: assertGovernanceConfiguration(),
+      queryProposals: queryProposalList,
+      parseProposal: parseProposalFromNative,
+    });
+  } catch (err) {
+    const detail =
+      err instanceof ProposalLoadError
+        ? err.message
+        : 'Failed to load proposals from the governance contract';
+    throw new GovernanceReadError(detail, err);
   }
 
-  if (allowMockFallback) {
-    return MOCK_PROPOSALS.map((p) => ({
+  return result.proposals.map((p) => {
+    const confirmedVetoes = getVetoHistory(p.id);
+    return {
       ...p,
       userVote: userVotes.get(p.id),
-      vetoHistory: getVetoHistory(p.id),
-    }));
-  }
-
-  throw new GovernanceReadError(
-    'Governance authority returned an unsuccessful simulation for list_proposals'
-  );
+      vetoHistory: p.vetoHistory?.length ? p.vetoHistory : confirmedVetoes,
+    };
+  });
 }
 
 export const getProposals = fetchProposals;
@@ -918,7 +944,7 @@ export async function fetchProposal(
   const proposals = await fetchProposals(options);
   const proposal = proposals.find((p) => p.id === id);
   if (!proposal) return null;
-  return { ...proposal, userVote: userVotes.get(id), vetoHistory: getVetoHistory(id) };
+  return { ...proposal, userVote: userVotes.get(id) };
 }
 
 // ─── Governance write boundary (#1044, #1045) ─────────────────────────────────
@@ -926,8 +952,7 @@ export async function fetchProposal(
 // Every mutation below is a real signed Soroban transaction: it is simulated
 // before the wallet is prompted (#1044) and confirmed under an explicit bound
 // afterwards (#1045), via `src/lib/governance-tx.ts`. None of them writes to
-// MOCK_PROPOSALS — that array is a read-only fallback for the proposal *list*
-// when no governance contract is configured, and a write against an
+// MOCK_PROPOSALS — no production path reads that array (#1040), and a write against an
 // unconfigured deployment raises `CONTRACT_NOT_CONFIGURED` instead of
 // fabricating a local tally.
 //
@@ -2036,10 +2061,7 @@ export async function fetchVotesForAddress(address: string): Promise<VoteCastEve
           const proposalId = Number(decodeHexOrUtf8Topic(evt.topics?.[1]) ?? 0);
           const support = decodeHexOrUtf8Topic(evt.topics?.[3]);
           const vote: VoteChoice = support === 'true' || support === '1' ? 'For' : 'Against';
-          const mockTitle = governanceMocksAllowed()
-            ? MOCK_PROPOSALS.find((p) => p.id === proposalId)?.title
-            : undefined;
-          const proposalTitle = mockTitle ?? `Proposal #${proposalId}`;
+          const proposalTitle = `Proposal #${proposalId}`;
           const timestamp = tx.created_at ? Math.floor(Date.parse(tx.created_at) / 1000) : 0;
 
           votes.push({
